@@ -191,25 +191,9 @@ fn runService(app: *const App) i32 {
     _ = setVirtualRoot(session.cwd[0..]) orelse unreachable;
     session.cwd_len = 1;
     var next_accept_poll: u64 = 0;
+    var service_loop = r4os.ServiceLoop.init(app.sys, endpoint_handle, .{});
 
-    while (!app.sys.programShouldClose()) {
-        const poll = app.sys.serviceEndpointPoll(endpoint_handle);
-        if (poll < 0) {
-            closeSession(app, &session, &stats, "endpoint-poll");
-            closeListener(app, &stats);
-            _ = app.sys.serviceEndpointUnregister(endpoint_handle);
-            return poll;
-        }
-        if (poll > 0) {
-            const rc = handleRequest(app, endpoint_handle, &stats);
-            if (rc < 0) {
-                closeSession(app, &session, &stats, "endpoint-request");
-                closeListener(app, &stats);
-                _ = app.sys.serviceEndpointUnregister(endpoint_handle);
-                return rc;
-            }
-        }
-
+    while (true) {
         if (!session.active) {
             const now = app.sys.ticks();
             if (now >= next_accept_poll) {
@@ -237,9 +221,29 @@ fn runService(app: *const App) i32 {
             }
             pollSession(app, endpoint_handle, &session, &stats);
         }
-        app.sys.sleepTicks(1);
+
+        const deadline = if (session.active) app.sys.ticks() +| 1 else next_accept_poll;
+        switch (service_loop.wait(deadline)) {
+            .requests => |pending| {
+                const rc = service_loop.drain(pending, handleRequest, .{ app, endpoint_handle, &stats });
+                if (rc >= 0) continue;
+                closeSession(app, &session, &stats, "endpoint-request");
+                closeListener(app, &stats);
+                _ = app.sys.serviceEndpointUnregister(endpoint_handle);
+                return rc;
+            },
+            .deadline, .idle => {},
+            .stop => break,
+            .failure => |raw| {
+                closeSession(app, &session, &stats, "endpoint-wait");
+                closeListener(app, &stats);
+                _ = app.sys.serviceEndpointUnregister(endpoint_handle);
+                return raw;
+            },
+        }
     }
 
+    service_loop.report(service_name);
     closeSession(app, &session, &stats, "program-close");
     closeListener(app, &stats);
     _ = app.sys.serviceEndpointUnregister(endpoint_handle);
