@@ -21,6 +21,7 @@ const service_register_wait_ticks: u32 = 120;
 const tcp_service_wait_ms: u64 = 500;
 const tcp_write_wait_ms: u64 = 5000;
 const session_idle_ms: u64 = 5 * 60 * 1000;
+const control_session_capacity: usize = 4;
 const accept_idle_poll_ticks: u64 = 10;
 const data_accept_wait_ms: u64 = 10000;
 const data_idle_ms: u64 = 3000;
@@ -110,6 +111,7 @@ const ServiceStats = struct {
     listen_ready: u32 = 0,
     accepted: u32 = 0,
     active_sessions: u32 = 0,
+    session_high: u32 = 0,
     closed: u32 = 0,
     commands: u32 = 0,
     auth_ok: u32 = 0,
@@ -187,47 +189,45 @@ fn runService(app: *const App) i32 {
         return -1;
     }
 
-    var session = Session{};
-    _ = setVirtualRoot(session.cwd[0..]) orelse unreachable;
-    session.cwd_len = 1;
+    var sessions: [control_session_capacity]Session = [_]Session{.{}} ** control_session_capacity;
     var next_accept_poll: u64 = 0;
+    var next_maintenance_poll: u64 = 0;
     var service_loop = r4os.ServiceLoop.init(app.sys, endpoint_handle, .{});
 
     while (true) {
-        if (!session.active) {
-            const now = app.sys.ticks();
-            if (now >= next_accept_poll) {
-                if (session.stor_cleanup_pending) {
-                    // Do not overwrite the retained cleanup claim by
-                    // resetting Session for a new client. Retry at the same
-                    // bounded cadence as accept polling until Abort proves
-                    // that the exact caller-owned stream is gone.
-                    _ = resolveStoreTransfer(app, &session, &stats);
-                    next_accept_poll = now + accept_idle_poll_ticks;
-                } else if (pollClient(app, &session, &stats)) {
-                    next_accept_poll = now;
-                } else {
-                    next_accept_poll = now + accept_idle_poll_ticks;
-                }
+        const now = app.sys.ticks();
+        if (now >= next_maintenance_poll) {
+            for (&sessions) |*session| {
+                if (!session.stor_cleanup_pending) continue;
+                // Retry independently of further client commands. Inactive
+                // slots retain their exact caller-owned stage claim and are
+                // not reused until cleanup or publication is conclusive.
+                _ = resolveStoreTransfer(app, session, &stats);
             }
-        } else {
-            const now = app.sys.ticks();
-            if (session.stor_cleanup_pending and now >= next_accept_poll) {
-                // Retry independently of further client commands. A client
-                // is allowed to stop after the 451 response, but the service
-                // must still resolve or relinquish the retained owner claim.
-                _ = resolveStoreTransfer(app, &session, &stats);
-                next_accept_poll = now + accept_idle_poll_ticks;
-            }
-            pollSession(app, endpoint_handle, &session, &stats);
+            next_maintenance_poll = now + accept_idle_poll_ticks;
         }
 
-        const deadline = if (session.active) app.sys.ticks() +| 1 else next_accept_poll;
+        if (now >= next_accept_poll) {
+            if (availableSession(sessions[0..])) |session| {
+                _ = pollClient(app, session, &stats);
+            }
+            next_accept_poll = now + accept_idle_poll_ticks;
+        }
+
+        for (&sessions) |*session| {
+            if (session.active) pollSession(app, endpoint_handle, session, &stats);
+        }
+
+        const after_poll = app.sys.ticks();
+        const deadline = if (activeSessionCount(sessions[0..]) != 0)
+            after_poll +| 1
+        else
+            @min(next_accept_poll, next_maintenance_poll);
         switch (service_loop.wait(deadline)) {
             .requests => |pending| {
                 const rc = service_loop.drain(pending, handleRequest, .{ app, endpoint_handle, &stats });
                 if (rc >= 0) continue;
-                closeSession(app, &session, &stats, "endpoint-request");
+                closeAllSessions(app, sessions[0..], &stats, "endpoint-request");
                 closeListener(app, &stats);
                 _ = app.sys.serviceEndpointUnregister(endpoint_handle);
                 return rc;
@@ -235,7 +235,7 @@ fn runService(app: *const App) i32 {
             .deadline, .idle => {},
             .stop => break,
             .failure => |raw| {
-                closeSession(app, &session, &stats, "endpoint-wait");
+                closeAllSessions(app, sessions[0..], &stats, "endpoint-wait");
                 closeListener(app, &stats);
                 _ = app.sys.serviceEndpointUnregister(endpoint_handle);
                 return raw;
@@ -244,7 +244,7 @@ fn runService(app: *const App) i32 {
     }
 
     service_loop.report(service_name);
-    closeSession(app, &session, &stats, "program-close");
+    closeAllSessions(app, sessions[0..], &stats, "program-close");
     closeListener(app, &stats);
     _ = app.sys.serviceEndpointUnregister(endpoint_handle);
     app.sys.println("FTPSVC stopped cleanly");
@@ -285,6 +285,10 @@ fn replyStatus(app: *const App, endpoint_handle: u32, request_id: u32, stats: *S
     _ = appendU64(out[0..], &pos, @intCast(stats.accepted));
     _ = appendText(out[0..], &pos, " active=");
     _ = appendU64(out[0..], &pos, @intCast(stats.active_sessions));
+    _ = appendByte(out[0..], &pos, '/');
+    _ = appendU64(out[0..], &pos, control_session_capacity);
+    _ = appendText(out[0..], &pos, " high=");
+    _ = appendU64(out[0..], &pos, @intCast(stats.session_high));
     _ = appendText(out[0..], &pos, " closed=");
     _ = appendU64(out[0..], &pos, @intCast(stats.closed));
     _ = appendText(out[0..], &pos, " commands=");
@@ -387,7 +391,8 @@ fn pollClient(app: *const App, session: *Session, stats: *ServiceStats) bool {
     session.cwd_len = 1;
     session.last_activity = app.sys.ticks();
     stats.accepted +%= 1;
-    stats.active_sessions = 1;
+    stats.active_sessions +%= 1;
+    if (stats.active_sessions > stats.session_high) stats.session_high = stats.active_sessions;
     setLastError(stats, "accepted");
     app.sys.write("FTPSVC client accepted conn=");
     app.sys.printU64(@intCast(accept.conn_id));
@@ -1867,9 +1872,28 @@ fn closeSession(app: *const App, session: *Session, stats: *ServiceStats, reason
     session.conn_id = 0;
     session.line_len = 0;
     session.rename_from_len = 0;
-    stats.active_sessions = 0;
+    if (stats.active_sessions != 0) stats.active_sessions -= 1;
     stats.closed +%= 1;
     setLastError(stats, reason);
+}
+
+fn availableSession(sessions: []Session) ?*Session {
+    for (sessions) |*session| {
+        if (!session.active and !session.stor_cleanup_pending) return session;
+    }
+    return null;
+}
+
+fn activeSessionCount(sessions: []const Session) usize {
+    var count: usize = 0;
+    for (sessions) |session| {
+        if (session.active) count += 1;
+    }
+    return count;
+}
+
+fn closeAllSessions(app: *const App, sessions: []Session, stats: *ServiceStats, reason: []const u8) void {
+    for (sessions) |*session| closeSession(app, session, stats, reason);
 }
 
 fn closeTcpHandle(app: *const App, conn_id: u32) void {
@@ -1906,12 +1930,18 @@ fn tcpReadTransientRecoverable(app: *const App, conn_id: u32, stats: *ServiceSta
 fn tcpReadRecovery(app: *const App, conn_id: u32, stats: *ServiceStats) TcpReadRecovery {
     var poll: r4os.abi.NetServiceTcpResult = .{};
     const rc = app.net.tcpPollServiceWait(conn_id, &poll, tcpServiceWaitTicks(app));
-    if (rc != 0) {
-        noteTcpTransient(stats, null, rc, .read);
-        return .transient;
+    const valid_poll = poll.action == r4os.abi.net_service_tcp_action_poll;
+    if (valid_poll) {
+        noteTcpPollStats(stats, &poll);
+        if (tcpPollConnectionClosed(&poll)) return .closed;
     }
-    noteTcpPollStats(stats, &poll);
-    if (tcpPollConnectionClosed(&poll)) return .closed;
+    if (rc != 0) {
+        if (!valid_poll or tcpServiceTransientResult(&poll)) {
+            noteTcpTransient(stats, if (valid_poll) &poll else null, rc, .read);
+            return .transient;
+        }
+        return .failed;
+    }
     if (tcpServiceTransientResult(&poll)) {
         noteTcpTransient(stats, &poll, poll.result, .read);
         return .transient;
@@ -1962,6 +1992,7 @@ fn tcpPollConnectionClosed(result: *const r4os.abi.NetServiceTcpResult) bool {
     if (result.pending_rx != 0) return false;
     if (tcpLifecycleTerminal(result.lifecycle_cause)) return true;
     const status = tcpServiceStatusCode(result);
+    if (status == r4os.abi.net_service_status_timeout) return false;
     if (result.result != 0 and status != r4os.abi.net_service_status_would_block and status != r4os.abi.net_service_status_timeout) return true;
     if (status == r4os.abi.net_service_status_would_block or result.lifecycle_cause == r4os.abi.net_service_socket_lifecycle_would_block) return false;
     if ((result.flags & r4os.abi.net_service_tcp_flag_handle_valid) == 0) return true;
@@ -2256,8 +2287,48 @@ fn runSelfTest(app: *const App) i32 {
     if (!expectNormalize(app, "C:\\R4OS", ".\\CONFIG\\..\\SERVICES", "C:\\R4OS\\SERVICES")) return 1;
     if (!expectDisplayPath(app, "C:\\", "/C")) return 1;
     if (!expectDisplayPath(app, "C:\\R4OS", "/C/R4OS")) return 1;
+    if (!tcpRecoveryContractProbe()) {
+        app.sys.println("FTPSVC selftest FAILED tcp-recovery");
+        return 1;
+    }
+    if (!sessionPoolContractProbe()) {
+        app.sys.println("FTPSVC selftest FAILED session-pool");
+        return 1;
+    }
     app.sys.println("FTPSVC selftest: OK");
     return 0;
+}
+
+fn sessionPoolContractProbe() bool {
+    var sessions: [control_session_capacity]Session = [_]Session{.{}} ** control_session_capacity;
+    for (&sessions) |*session| session.active = true;
+    if (availableSession(sessions[0..]) != null) return false;
+    if (activeSessionCount(sessions[0..]) != control_session_capacity) return false;
+
+    sessions[1].active = false;
+    sessions[1].stor_cleanup_pending = true;
+    if (availableSession(sessions[0..]) != null) return false;
+    sessions[1].stor_cleanup_pending = false;
+    return availableSession(sessions[0..]) != null and
+        activeSessionCount(sessions[0..]) == control_session_capacity - 1;
+}
+
+fn tcpRecoveryContractProbe() bool {
+    const timeout = r4os.abi.NetServiceTcpResult{
+        .action = r4os.abi.net_service_tcp_action_poll,
+        .result = 0,
+        .service_status = r4os.abi.net_service_status_timeout,
+        .lifecycle_cause = r4os.abi.net_service_socket_lifecycle_timeout,
+    };
+    if (tcpPollConnectionClosed(&timeout)) return false;
+
+    const bad_handle = r4os.abi.NetServiceTcpResult{
+        .action = r4os.abi.net_service_tcp_action_poll,
+        .result = r4os.abi.tcp_result_no_connection,
+        .service_status = r4os.abi.net_service_status_failed,
+        .lifecycle_cause = r4os.abi.net_service_socket_lifecycle_bad_handle,
+    };
+    return tcpPollConnectionClosed(&bad_handle);
 }
 
 fn expectNormalize(app: *const App, cwd: []const u8, input: []const u8, expected: []const u8) bool {

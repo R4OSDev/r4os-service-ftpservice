@@ -3,14 +3,16 @@
 
 FTPSVC.R4X ist der FTP-Serverdienst fuer R4OS.
 
-Stand 0.60.20 (Kommandoumfang seit 0.55.13):
+Stand 0.74.3 (Kommandoumfang seit 0.55.13):
 
 - Service-Name: `FTPSVC`
 - Zielpfad im Image: `C:\R4OS\SERVICES\FTPSVC.R4X`
 - Control-Port im Gast: `21`
 - Passiver Datenport im Gast: `2020`
-- QEMU-Standardweiterleitung: Host `127.0.0.1:10021` -> R4OS
-  `10.0.2.15:21`, Host `127.0.0.1:10020` -> R4OS `10.0.2.15:2020`
+- Auf echter Hardware im LAN: Control-Port `21`, passiver Datenport `2020`
+- Die normalen QEMU-Starter geben nur SSH nach aussen frei. Fuer einen
+  manuellen FTP-Test unter QEMU muessen Port `21` und `2020` ausdruecklich
+  weitergeleitet werden.
 - Standard-Zugangsdaten: `r4os` / `rosebud`
 - Standard-Service-Start: `auto`
 
@@ -46,6 +48,21 @@ FTP-Datenkanal. Ohne vorbereiteten Datenkanal bleibt ein Control-Listing fuer
 Diagnose und alte 0.55.12-Abnahme moeglich; `STAT` bleibt bewusst Control-
 basiert. Downloads laufen ueber `fileReadAt`.
 
+Seit 0.74.3 enden Datenkanaele nach dem letzten bestaetigten Nutzdatenbyte mit
+einem regulaeren TCP-FIN statt mit einem Reset. Dadurch erhalten insbesondere
+FileZilla und andere Windows-Clients das vollstaendige Listing beziehungsweise
+die vollstaendige Datei und einen normalen EOF. Ein strukturierter terminaler
+Poll-Befund beendet ausserdem sofort die zugehoerige FTP-Sitzung; ein bereits
+ungueltiger Control-Handle bleibt nicht bis zum Idle-Timeout aktiv.
+
+FTPSVC verwaltet bis zu vier Control-Sitzungen kooperativ. Damit kann ein
+Client wie FileZilla seine offene Browser-Sitzung behalten und fuer einen
+Transfer parallel eine zweite Anmeldung auf Port 21 verwenden. Datei- und
+Datenkanaloperationen bleiben innerhalb des Dienstes serialisiert; insbesondere
+kann wegen des festen passiven Ports 2020 jeweils nur ein passiver Transfer
+vorbereitet sein. `SERVMAN STATUS FTPSVC` zeigt aktuelle und bisher maximale
+Control-Sitzungen als `active=<n>/4 high=<n>`.
+
 Seit 0.60.20 schreibt `STOR` nie direkt in den sichtbaren Zielnamen. Der
 Dienst reserviert einen privaten 8.3-Sibling-Stage, streamt ihn mit
 `fileStreamBegin(open_create)`/`fileStreamWrite`, behaelt die Ownership bei
@@ -67,7 +84,12 @@ Nuetzliche Aufrufe:
 
     SERVMAN STATUS FTPSVC
 
-Host-Abnahmen:
+Build- und Systemabnahmen:
 
-    Tests/Runtime/Run-FtpServiceControlLiveTest05512.ps1
-    Tests/Runtime/Run-FtpServiceTransferLiveTest05513.ps1
+    Repositories/Services/FtpService/Build.sh
+    ./Tools/Build.sh -test
+
+Der netzlose Headless-Systemtest prueft keinen echten FTP-Transfer. Der
+Datenkanal muss deshalb zusaetzlich mit einem FTP-Client gegen echte Hardware
+oder eine QEMU-Sitzung mit den beiden expliziten Portweiterleitungen abgenommen
+werden.
