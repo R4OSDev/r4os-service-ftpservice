@@ -1133,7 +1133,7 @@ fn storeFile(app: *const App, endpoint_handle: u32, session: *Session, stats: *S
         return;
     };
     copyFixed(stats.last_path[0..], path);
-    if (isDirectSystemWriteBlocked(path)) {
+    if (isDirectSystemWriteBlocked(app, path)) {
         setLastError(stats, "stor-system-path");
         _ = sendReply(app, session.conn_id, stats, "550 Use the update inbox for system files\r\n");
         return;
@@ -1361,7 +1361,7 @@ fn deleteFile(app: *const App, session: *Session, stats: *ServiceStats, arg: []c
         return;
     };
     copyFixed(stats.last_path[0..], path);
-    if (isDirectSystemWriteBlocked(path)) {
+    if (isDirectSystemWriteBlocked(app, path)) {
         setLastError(stats, "dele-system-path");
         _ = sendReply(app, session.conn_id, stats, "550 Use the update inbox for system files\r\n");
         return;
@@ -1408,7 +1408,7 @@ fn renameFrom(app: *const App, session: *Session, stats: *ServiceStats, arg: []c
         _ = sendReply(app, session.conn_id, stats, "550 Bad path\r\n");
         return;
     };
-    if (isDirectSystemWriteBlocked(path)) {
+    if (isDirectSystemWriteBlocked(app, path)) {
         setLastError(stats, "rnfr-system-path");
         _ = sendReply(app, session.conn_id, stats, "550 Use the update inbox for system files\r\n");
         return;
@@ -1453,8 +1453,8 @@ fn renameTo(app: *const App, session: *Session, stats: *ServiceStats, arg: []con
         _ = sendReply(app, session.conn_id, stats, "550 Bad path\r\n");
         return;
     };
-    if (isDirectSystemWriteBlocked(session.rename_from[0..session.rename_from_len]) or
-        isDirectSystemWriteBlocked(new_path))
+    if (isDirectSystemWriteBlocked(app, session.rename_from[0..session.rename_from_len]) or
+        isDirectSystemWriteBlocked(app, new_path))
     {
         setLastError(stats, "rnto-system-path");
         _ = sendReply(app, session.conn_id, stats, "550 Use the update inbox for system files\r\n");
@@ -1546,7 +1546,7 @@ fn makeDirectory(app: *const App, session: *Session, stats: *ServiceStats, arg: 
         _ = sendReply(app, session.conn_id, stats, "550 Bad path\r\n");
         return;
     };
-    if (isDirectoryCreateBlocked(path)) {
+    if (isDirectoryCreateBlocked(app, path)) {
         setLastError(stats, "mkd-system-path");
         _ = sendReply(app, session.conn_id, stats, "550 Use the update inbox for system files\r\n");
         return;
@@ -1612,7 +1612,7 @@ fn removeDirectory(app: *const App, session: *Session, stats: *ServiceStats, arg
         _ = sendReply(app, session.conn_id, stats, "550 Directory unavailable\r\n");
         return;
     }
-    if (isDirectSystemWriteBlocked(path)) {
+    if (isDirectSystemWriteBlocked(app, path)) {
         setLastError(stats, "rmd-system-path");
         _ = sendReply(app, session.conn_id, stats, "550 Use the update inbox for system files\r\n");
         return;
@@ -2196,7 +2196,8 @@ fn isPathSeparator(ch: u8) bool {
     return ch == '\\' or ch == '/';
 }
 
-fn isDirectSystemWriteBlocked(path: []const u8) bool {
+fn isDirectSystemWriteBlocked(app: *const App, path: []const u8) bool {
+    if (r4os.runtime_context.offlineRepairAllowed(&app.sys, path)) return false;
     if (isUpdateInboxFilePath(path)) return false;
     return isPathAtOrBelow(path, "C:\\R4OS") or
         isPathAtOrBelow(path, "C:\\BOOT") or
@@ -2209,9 +2210,9 @@ fn isDirectSystemWriteBlocked(path: []const u8) bool {
         isPathAtOrBelow(path, "D:\\LIMINE");
 }
 
-fn isDirectoryCreateBlocked(path: []const u8) bool {
+fn isDirectoryCreateBlocked(app: *const App, path: []const u8) bool {
     if (isUpdateDirectoryPath(path)) return false;
-    return isDirectSystemWriteBlocked(path);
+    return isDirectSystemWriteBlocked(app, path);
 }
 
 fn isUpdateInboxFilePath(path: []const u8) bool {
