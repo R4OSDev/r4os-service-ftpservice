@@ -107,3 +107,14 @@ werden nicht stillschweigend ueberschrieben. Fuer eine gezielte Reparatur
 eine neue Datei hochladen und per SSH-COPY ersetzen oder ausdruecklich
 loeschen und neu uebertragen. Lesbarkeit, Hashes und Erfolg jeder Operation
 pruefen.
+
+0.76.8: Gemeinsame Offline-Volume-Nutzungen
+----------------------------------------
+LIST, RETR und STOR halten eine gemeinsame Storage-Volume-Nutzung ueber die
+Datenverbindung und ihre Dateiarbeit. Ein exklusiv belegtes oder nicht
+verfuegbares Ziel wird vor Datenarbeit mit FTP 450 abgewiesen. Alle
+Abschluss-/Fehlerpfade geben die Nutzung frei; unbeteiligte Volumes bleiben
+erreichbar. Der create-only Publikationsvertrag bleibt erhalten.
+
+Uploads direkt nach X:\ beruecksichtigen die Laufwerkswurzel als gueltigen
+Elternpfad. Die Elternsuche darf ihren Separator bei Index 2 nicht uebergehen.

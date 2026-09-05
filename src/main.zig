@@ -657,6 +657,15 @@ fn listPath(app: *const App, endpoint_handle: u32, session: *Session, stats: *Se
         _ = sendReply(app, session.conn_id, stats, "550 Bad path\r\n");
         return;
     };
+    const storage = r4os.storage.Context{ .sys = &app.sys };
+    var volume_use: u64 = 0;
+    var lease_path: [path_max:0]u8 = .{0} ** path_max;
+    const lease_z = copyZ(lease_path[0..], path) orelse return;
+    if (!isVirtualRoot(path) and storage.transferUseBegin(lease_z, &volume_use) != 0) {
+        _ = sendReply(app, session.conn_id, stats, "450 Volume busy or unavailable\r\n");
+        return;
+    }
+    defer _ = storage.useEnd(&volume_use);
     copyFixed(stats.last_path[0..], path);
     switch (directoryState(app, path)) {
         .found => {},
@@ -888,6 +897,15 @@ fn retrieveFile(app: *const App, endpoint_handle: u32, session: *Session, stats:
         _ = sendReply(app, session.conn_id, stats, "550 Bad path\r\n");
         return;
     };
+    const storage = r4os.storage.Context{ .sys = &app.sys };
+    var volume_use: u64 = 0;
+    var lease_path: [path_max:0]u8 = .{0} ** path_max;
+    const lease_z = copyZ(lease_path[0..], path) orelse return;
+    if (storage.transferUseBegin(lease_z, &volume_use) != 0) {
+        _ = sendReply(app, session.conn_id, stats, "450 Volume busy or unavailable\r\n");
+        return;
+    }
+    defer _ = storage.useEnd(&volume_use);
     copyFixed(stats.last_path[0..], path);
     var path_z: [path_max:0]u8 = .{0} ** path_max;
     const z = copyZ(path_z[0..], path) orelse {
@@ -1132,6 +1150,15 @@ fn storeFile(app: *const App, endpoint_handle: u32, session: *Session, stats: *S
         _ = sendReply(app, session.conn_id, stats, "550 Bad path\r\n");
         return;
     };
+    const storage = r4os.storage.Context{ .sys = &app.sys };
+    var volume_use: u64 = 0;
+    var lease_path: [path_max:0]u8 = .{0} ** path_max;
+    const lease_z = copyZ(lease_path[0..], path) orelse return;
+    if (storage.transferUseBegin(lease_z, &volume_use) != 0) {
+        _ = sendReply(app, session.conn_id, stats, "450 Volume busy or unavailable\r\n");
+        return;
+    }
+    defer _ = storage.useEnd(&volume_use);
     copyFixed(stats.last_path[0..], path);
     if (isDirectSystemWriteBlocked(app, path)) {
         setLastError(stats, "stor-system-path");
@@ -1779,7 +1806,9 @@ fn parentDirectoryState(app: *const App, path: []const u8) FileLookupState {
             return directoryState(app, path[0..parent_len]);
         }
     }
-    return .not_found;
+    // The loop stops before the separator in X:\; a root-level file still
+    // has that mounted drive root as its parent.
+    return if (driveRootLetter(path[0..3]) != null) directoryState(app, path[0..3]) else .not_found;
 }
 
 fn parsePortArgument(arg_raw: []const u8, out_ip: *[4]u8, out_port: *u16) bool {
