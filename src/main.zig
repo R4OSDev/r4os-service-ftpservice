@@ -265,7 +265,7 @@ fn handleRequest(app: *const App, endpoint_handle: u32, stats: *ServiceStats) i3
         else => blk: {
             stats.bad_ops +%= 1;
             setLastError(stats, "bad-op");
-            break :blk app.sys.serviceEndpointReply(endpoint_handle, header.request_id, r4os.abi.service_api_result_bad_op, "BADOP");
+            break :blk r4os.app_services.replyIfPending(app.sys, endpoint_handle, header.request_id, r4os.abi.service_api_result_bad_op, "BADOP");
         },
     };
 }
@@ -363,12 +363,12 @@ fn replyStatus(app: *const App, endpoint_handle: u32, request_id: u32, stats: *S
     _ = appendText(out[0..], &pos, spanZ(stats.last_path[0..]));
     _ = appendText(out[0..], &pos, " last=");
     _ = appendText(out[0..], &pos, spanZ(stats.last_error[0..]));
-    return app.sys.serviceEndpointReply(endpoint_handle, request_id, r4os.abi.service_api_result_ok, out[0..pos]);
+    return r4os.app_services.replyIfPending(app.sys, endpoint_handle, request_id, r4os.abi.service_api_result_ok, out[0..pos]);
 }
 
 fn replyPing(app: *const App, endpoint_handle: u32, request_id: u32, stats: *ServiceStats) i32 {
     stats.pings +%= 1;
-    return app.sys.serviceEndpointReply(endpoint_handle, request_id, r4os.abi.service_api_result_ok, "FTPSVC PONG");
+    return r4os.app_services.replyIfPending(app.sys, endpoint_handle, request_id, r4os.abi.service_api_result_ok, "FTPSVC PONG");
 }
 
 fn pollClient(app: *const App, session: *Session, stats: *ServiceStats) bool {
