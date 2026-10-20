@@ -1,4 +1,7 @@
 const r4os = @import("r4os");
+const std = @import("std");
+const path_text = @import("path_text");
+const control_line = @import("control_line.zig");
 
 const service_name = "FTPSVC";
 const service_path = "C:\\R4OS\\SERVICES\\FTPSVC.R4X";
@@ -100,6 +103,7 @@ const Session = struct {
     cwd_len: usize = 1,
     line: [line_max]u8 = .{0} ** line_max,
     line_len: usize = 0,
+    line_discarding: bool = false,
     last_activity: u64 = 0,
 };
 
@@ -433,32 +437,30 @@ fn pollSession(app: *const App, endpoint_handle: u32, session: *Session, stats: 
     session.last_activity = now;
     var i: usize = 0;
     while (i < got_len and session.active) : (i += 1) {
-        const ch = buf[i];
-        if (ch == '\r') continue;
-        if (ch == '\n') {
-            const line = session.line[0..session.line_len];
-            processCommand(app, endpoint_handle, session, stats, line);
-            session.line_len = 0;
-            continue;
+        switch (control_line.push(&session.line, &session.line_len, &session.line_discarding, buf[i])) {
+            .more => {},
+            .rejected => {
+                _ = sendReply(app, session.conn_id, stats, "500 Line too long\r\n");
+                setLastError(stats, "line-too-long");
+            },
+            .ready => {
+                processCommand(app, endpoint_handle, session, stats, session.line[0..session.line_len]);
+                session.line_len = 0;
+            },
         }
-        if (session.line_len >= session.line.len) {
-            session.line_len = 0;
-            _ = sendReply(app, session.conn_id, stats, "500 Line too long\r\n");
-            setLastError(stats, "line-too-long");
-            continue;
-        }
-        session.line[session.line_len] = ch;
-        session.line_len += 1;
     }
 }
 
 fn processCommand(app: *const App, endpoint_handle: u32, session: *Session, stats: *ServiceStats, line_raw: []const u8) void {
-    const line = trim(line_raw);
-    if (line.len == 0) return;
-    var split: usize = 0;
-    while (split < line.len and line[split] != ' ' and line[split] != '\t') : (split += 1) {}
-    const cmd = line[0..split];
-    const arg = trim(line[split..]);
+    if (line_raw.len == 0) return;
+    const command = parseControlCommand(line_raw) orelse {
+        stats.path_errors +%= 1;
+        setLastError(stats, "invalid-control-record");
+        _ = sendReply(app, session.conn_id, stats, "501 Invalid UTF8 or control record\r\n");
+        return;
+    };
+    const cmd = command.verb;
+    const arg = command.argument;
     copyFixed(stats.last_command[0..], cmd);
     stats.commands +%= 1;
 
@@ -510,8 +512,10 @@ fn processCommand(app: *const App, endpoint_handle: u32, session: *Session, stat
         return;
     }
     if (equalsIgnoreCase(cmd, "OPTS")) {
-        if (startsWithIgnoreCase(arg, "UTF8")) {
+        if (equalsIgnoreCase(arg, "UTF8") or equalsIgnoreCase(arg, "UTF8 ON")) {
             _ = sendReply(app, session.conn_id, stats, "200 UTF8 enabled\r\n");
+        } else if (startsWithIgnoreCase(arg, "UTF8")) {
+            _ = sendReply(app, session.conn_id, stats, "504 UTF8 is required; option unsupported\r\n");
         } else {
             _ = sendReply(app, session.conn_id, stats, "502 Option not implemented\r\n");
         }
@@ -651,7 +655,7 @@ fn replyPwd(app: *const App, session: *const Session, stats: *ServiceStats) void
 
 fn listPath(app: *const App, endpoint_handle: u32, session: *Session, stats: *ServiceStats, arg: []const u8, names_only: bool, stat_control: bool) void {
     var normalized: [path_max]u8 = .{0} ** path_max;
-    const path = normalizeFtpPath(session.cwd[0..session.cwd_len], if (trim(arg).len == 0) "." else arg, normalized[0..]) orelse {
+    const path = normalizeFtpPath(session.cwd[0..session.cwd_len], if (arg.len == 0) "." else arg, normalized[0..]) orelse {
         stats.path_errors +%= 1;
         setLastError(stats, "list-path");
         _ = sendReply(app, session.conn_id, stats, "550 Bad path\r\n");
@@ -685,7 +689,10 @@ fn listPath(app: *const App, endpoint_handle: u32, session: *Session, stats: *Se
         _ = sendReply(app, session.conn_id, stats, "150-Directory listing follows\r\n");
         if (isVirtualRoot(path)) {
             stats.list_root +%= 1;
-            sendRootListing(app, session.conn_id, stats, names_only);
+            if (!sendRootListing(app, session.conn_id, stats, names_only)) {
+                _ = sendReply(app, session.conn_id, stats, "451 Directory listing failed\r\n");
+                return;
+            }
         } else {
             stats.list_dirs +%= 1;
             if (!sendDirectoryListing(app, session.conn_id, stats, path, names_only)) {
@@ -722,7 +729,7 @@ fn listPath(app: *const App, endpoint_handle: u32, session: *Session, stats: *Se
     _ = sendReply(app, session.conn_id, stats, "226 Directory send OK\r\n");
 }
 
-fn sendRootListing(app: *const App, conn_id: u32, stats: *ServiceStats, names_only: bool) void {
+fn sendRootListing(app: *const App, conn_id: u32, stats: *ServiceStats, names_only: bool) bool {
     var index: u32 = 0;
     while (index < 26) : (index += 1) {
         const info = app.sys.driveInfo(index) orelse continue;
@@ -733,8 +740,9 @@ fn sendRootListing(app: *const App, conn_id: u32, stats: *ServiceStats, names_on
         if (!names_only) _ = appendText(line[0..], &pos, "dr-xr-xr-x 1 r4os r4os 0 Jan 01 00:00 ");
         _ = appendByte(line[0..], &pos, letter);
         _ = appendText(line[0..], &pos, "\r\n");
-        _ = sendReply(app, conn_id, stats, line[0..pos]);
+        if (!sendReply(app, conn_id, stats, line[0..pos])) return false;
     }
+    return true;
 }
 
 fn sendDirectoryListing(app: *const App, conn_id: u32, stats: *ServiceStats, path: []const u8, names_only: bool) bool {
@@ -743,20 +751,20 @@ fn sendDirectoryListing(app: *const App, conn_id: u32, stats: *ServiceStats, pat
     var index: u32 = 2;
     while (index < 258) : (index += 1) {
         var entry_path_buf: [path_max:0]u8 = .{0} ** path_max;
-        const kind = app.sys.dirEntry(dir_z, index, entry_path_buf[0 .. entry_path_buf.len - 1]);
-        if (kind == r4os.r4sys.dir_entry_result_end) break;
+        const kind = app.sys.dirEntry(dir_z, index, entry_path_buf[0..]);
+        if (kind == r4os.r4sys.dir_entry_result_end) return true;
         if (kind < 0) return false;
         const entry_path = spanZ(entry_path_buf[0..]);
         const name = baseName(entry_path);
+        if (!path_text.valid(entry_path, path_max - 1) or !path_text.validComponent(name)) return false;
         var size: u64 = 0;
         var entry_z: [path_max:0]u8 = .{0} ** path_max;
-        if (copyZ(entry_z[0..], entry_path)) |z| {
-            var info: r4os.abi.FileInfo = .{};
-            switch (fileLookup(app, z, &info)) {
-                .found => size = info.size,
-                .not_found => continue,
-                .io => return false,
-            }
+        const z = copyZ(entry_z[0..], entry_path) orelse return false;
+        var info: r4os.abi.FileInfo = .{};
+        switch (fileLookup(app, z, &info)) {
+            .found => size = info.size,
+            .not_found => continue,
+            .io => return false,
         }
 
         var line: [line_max]u8 = .{0} ** line_max;
@@ -771,9 +779,9 @@ fn sendDirectoryListing(app: *const App, conn_id: u32, stats: *ServiceStats, pat
             _ = appendText(line[0..], &pos, name);
         }
         _ = appendText(line[0..], &pos, "\r\n");
-        _ = sendReply(app, conn_id, stats, line[0..pos]);
+        if (!sendReply(app, conn_id, stats, line[0..pos])) return false;
     }
-    return true;
+    return false; // explicit bounded listing failure, never silent truncation
 }
 
 fn sendRootListingData(app: *const App, conn_id: u32, stats: *ServiceStats, names_only: bool) bool {
@@ -798,20 +806,20 @@ fn sendDirectoryListingData(app: *const App, conn_id: u32, stats: *ServiceStats,
     var index: u32 = 2;
     while (index < 258) : (index += 1) {
         var entry_path_buf: [path_max:0]u8 = .{0} ** path_max;
-        const kind = app.sys.dirEntry(dir_z, index, entry_path_buf[0 .. entry_path_buf.len - 1]);
-        if (kind == r4os.r4sys.dir_entry_result_end) break;
+        const kind = app.sys.dirEntry(dir_z, index, entry_path_buf[0..]);
+        if (kind == r4os.r4sys.dir_entry_result_end) return true;
         if (kind < 0) return false;
         const entry_path = spanZ(entry_path_buf[0..]);
         const name = baseName(entry_path);
+        if (!path_text.valid(entry_path, path_max - 1) or !path_text.validComponent(name)) return false;
         var size: u64 = 0;
         var entry_z: [path_max:0]u8 = .{0} ** path_max;
-        if (copyZ(entry_z[0..], entry_path)) |z| {
-            var info: r4os.abi.FileInfo = .{};
-            switch (fileLookup(app, z, &info)) {
-                .found => size = info.size,
-                .not_found => continue,
-                .io => return false,
-            }
+        const z = copyZ(entry_z[0..], entry_path) orelse return false;
+        var info: r4os.abi.FileInfo = .{};
+        switch (fileLookup(app, z, &info)) {
+            .found => size = info.size,
+            .not_found => continue,
+            .io => return false,
         }
 
         var line: [line_max]u8 = .{0} ** line_max;
@@ -828,7 +836,7 @@ fn sendDirectoryListingData(app: *const App, conn_id: u32, stats: *ServiceStats,
         _ = appendText(line[0..], &pos, "\r\n");
         if (!sendData(app, conn_id, stats, line[0..pos])) return false;
     }
-    return true;
+    return false; // explicit bounded listing failure, never silent truncation
 }
 
 fn preparePassive(app: *const App, session: *Session, stats: *ServiceStats, extended: bool) void {
@@ -943,7 +951,7 @@ fn retrieveFile(app: *const App, endpoint_handle: u32, session: *Session, stats:
     while (offset < info.size) {
         const remaining: usize = @intCast(@min(@as(u64, @intCast(buffer.len)), info.size - offset));
         const got_raw = app.sys.fileReadAt(z, @intCast(offset), buffer[0..remaining]);
-        if (got_raw <= 0) {
+        if (got_raw <= 0 or @as(usize, @intCast(got_raw)) > remaining) {
             stats.transfer_failures +%= 1;
             finishDataConnection(app, session, stats);
             setLastError(stats, "retr-read");
@@ -1264,13 +1272,16 @@ fn storeFile(app: *const App, endpoint_handle: u32, session: *Session, stats: *S
         return;
     }
 
-    _ = sendReply(app, session.conn_id, stats, "150 Opening data connection for upload\r\n");
+    // Claim the data connection before the positive preliminary reply. A
+    // conforming small/empty sender can finish immediately after150; leaving
+    // it unclaimed until then can lose admission when its FIN already arrived.
     const data_conn = openDataConnection(app, session, stats) orelse {
         stats.transfer_failures +%= 1;
         _ = cleanupStoreStream(app, session, stats);
         _ = sendReply(app, session.conn_id, stats, "425 Cannot open data connection\r\n");
         return;
     };
+    _ = sendReply(app, session.conn_id, stats, "150 Opening data connection for upload\r\n");
 
     var offset: u64 = 0;
     var idle_start = app.sys.ticks();
@@ -1900,6 +1911,7 @@ fn closeSession(app: *const App, session: *Session, stats: *ServiceStats, reason
     session.active = false;
     session.conn_id = 0;
     session.line_len = 0;
+    session.line_discarding = false;
     session.rename_from_len = 0;
     if (stats.active_sessions != 0) stats.active_sessions -= 1;
     stats.closed +%= 1;
@@ -2070,8 +2082,9 @@ fn directoryState(app: *const App, path: []const u8) FileLookupState {
 }
 
 fn normalizeFtpPath(cwd_raw: []const u8, arg_raw: []const u8, out: []u8) ?[]const u8 {
-    const arg = trim(arg_raw);
-    const cwd = trim(cwd_raw);
+    if (!path_text.valid(arg_raw, path_max - 1) or !path_text.valid(cwd_raw, path_max - 1)) return null;
+    const arg = arg_raw;
+    const cwd = cwd_raw;
     if (arg.len == 0 or equalsBytes(arg, ".")) {
         if (cwd.len == 0) return setVirtualRoot(out);
         return copyPath(out, cwd);
@@ -2434,7 +2447,7 @@ fn copyPathInto(out: []u8, out_len: *usize, src: []const u8) ?void {
 }
 
 fn copyZ(out: [:0]u8, text: []const u8) ?[*:0]const u8 {
-    if (text.len >= out.len) return null;
+    if (text.len >= out.len or !path_text.valid(text, path_max - 1)) return null;
     if (text.len != 0) @memcpy(out[0..text.len], text);
     out[text.len] = 0;
     return @ptrCast(out.ptr);
@@ -2534,4 +2547,31 @@ fn appendI64(dest: []u8, pos: *usize, value: i64) bool {
 
 fn setLastError(stats: *ServiceStats, label: []const u8) void {
     copyFixed(stats.last_error[0..], label);
+}
+
+const ControlCommand = struct { verb: []const u8, argument: []const u8 };
+fn parseControlCommand(line: []const u8) ?ControlCommand {
+    if (!path_text.validText(line)) return null;
+    const split = std.mem.indexOfScalar(u8, line, ' ') orelse line.len;
+    if (split == 0 or split > 16) return null;
+    const verb = line[0..split];
+    for (verb) |byte| if (!std.ascii.isAlphabetic(byte)) return null;
+    const raw = if (split < line.len) line[split + 1 ..] else "";
+    const path_verbs = [_][]const u8{ "CWD", "LIST", "NLST", "STAT", "SIZE", "RETR", "STOR", "DELE", "RNFR", "RNTO", "MKD", "RMD" };
+    for (path_verbs) |name| if (equalsIgnoreCase(verb, name)) return .{ .verb = verb, .argument = raw };
+    return .{ .verb = verb, .argument = trim(raw) };
+}
+test "FTP dispatch preserves pathname spaces and rejects complete invalid records" {
+    try std.testing.expectEqualStrings(" ä🙂.bin ", parseControlCommand("STOR  ä🙂.bin ").?.argument);
+    try std.testing.expect(parseControlCommand("STOR foo\x00bar") == null);
+    try std.testing.expect(parseControlCommand("STOR foo\rbar") == null);
+    try std.testing.expect(parseControlCommand("STOR \xc1\xa1") == null);
+    try std.testing.expect(parseControlCommand("STOR \xc3") == null);
+    var out: [path_max]u8 = undefined;
+    try std.testing.expectEqualStrings("C:\\TEMP\\ ä🙂.bin ", normalizeFtpPath("C:\\TEMP", " ä🙂.bin ", &out).?);
+    try std.testing.expect(normalizeFtpPath("C:\\TEMP", "bad\x00/../ok", &out) == null);
+    try std.testing.expect(normalizeFtpPath("C:\\TEMP", "\xe0\x80\xaf/../ok", &out) == null);
+    try std.testing.expect(normalizeFtpPath("C:\\TEMP", "x" ** 256 ++ "/../ok", &out) == null);
+    try std.testing.expect(normalizeFtpPath("C:\\TEMP", "\x81.bin", &out) == null);
+    std.testing.refAllDecls(control_line);
 }
