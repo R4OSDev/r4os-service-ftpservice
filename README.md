@@ -4,10 +4,15 @@
 
 ## Package
 
-- Version: `0.1.9`
+- Version: see `module.R4MF`
 - Image target: `/R4OS/SERVICES/FTPSVC.R4X`
 - Image scope: `full`
 - Canonical project manifest: `module.R4MF`
+
+FTPSVC runs as a Start2 service. A download record shares one deadline across
+its TCP writes and advances by the accepted prefix. An uncertain write ends
+the data connection. Upload staging and publication keep their separate
+commit and reconciliation rules.
 
 The manifest is the single source of truth for the artifact, imports, image
 target, and package metadata.

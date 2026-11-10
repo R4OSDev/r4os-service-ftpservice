@@ -35,7 +35,7 @@ const App = struct {
     sys: r4os.r4sys.Context,
     net: r4os.r4net.Context,
 
-    fn init(r4_app: *r4os.App) ?App {
+    fn init(r4_app: *r4os.App2) ?App {
         return .{
             .sys = r4_app.system(),
             .net = r4_app.networkLowLevel() orelse return null,
@@ -154,11 +154,15 @@ const ServiceStats = struct {
     last_error: [32]u8 = .{0} ** 32,
 };
 
-pub fn r4_app_main(r4_app: *r4os.App) i32 {
+pub fn r4_app_main(r4_app: *r4os.App2) i32 {
     var app = App.init(r4_app) orelse return r4os.abi.err_no_group;
-    if (hasArg(app.sys.argsRaw(), selftest_arg)) return runSelfTest(&app);
-    if (hasArg(app.sys.argsRaw(), ping_arg)) return runPingClient(&app);
-    if (hasArg(app.sys.argsRaw(), status_arg)) return runStatusClient(&app);
+    const action = serviceAction(r4_app) catch return r4os.abi.service_api_result_invalid;
+    switch (action) {
+        .selftest => return runSelfTest(&app),
+        .ping => return runPingClient(&app),
+        .status => return runStatusClient(&app),
+        .run => {},
+    }
     return runService(&app);
 }
 
@@ -170,8 +174,14 @@ fn runService(app: *const App) i32 {
 
     var info: r4os.abi.ServiceInfo = .{};
     var endpoint_handle: u32 = 0;
-    var waited: u32 = 0;
-    while (waited < service_register_wait_ticks and endpoint_handle == 0) : (waited += 1) {
+    const actual = app.sys.base.generation2 orelse return r4os.abi.err_no_group;
+    const clock = r4os.inventory_reader.PlatformClock.fromContext2(actual) catch return r4os.abi.err_no_fn;
+    var registration = r4os.rpc_budget.Budget.fromTicks(clock.read, service_register_wait_ticks) catch |err| return r4os.rpc_budget.code(err);
+    while (endpoint_handle == 0 and !app.sys.programShouldClose()) {
+        _ = registration.remainingTicks() catch |err| {
+            if (err == error.TimedOut) break;
+            return r4os.rpc_budget.code(err);
+        };
         const rc = app.sys.serviceEndpointRegister(service_name, 0, &info);
         if (rc == r4os.abi.service_api_result_ok and info.handle != 0) {
             endpoint_handle = info.handle;
@@ -380,6 +390,11 @@ fn pollClient(app: *const App, session: *Session, stats: *ServiceStats) bool {
     var structured: r4os.abi.NetServiceTcpResult = .{};
     const rc = app.net.tcpAcceptPollServiceResultWait(listen_port, &accept, &structured, tcpServiceWaitTicks(app));
     stats.last_tcp_result = if (rc == 0) structured.result else rc;
+    if (rc < 0 and acceptLostListener(&structured)) {
+        stats.listen_ready = 0;
+        _ = listenOnce(app, stats, tcpServiceWaitTicks(app));
+        return false;
+    }
     if (rc == 0) return false;
     if (rc < 0 or accept.conn_id == 0 or structured.result != r4os.abi.tcp_result_ok) {
         stats.tcp_errors +%= 1;
@@ -1782,7 +1797,7 @@ fn resetDataState(session: *Session) void {
 
 fn sendData(app: *const App, conn_id: u32, stats: *ServiceStats, data: []const u8) bool {
     if (data.len == 0) return true;
-    const wrote = app.net.tcpWritePacedServiceBounded(conn_id, data, app.sys.ticksFromMilliseconds(tcp_write_wait_ms), tcpServiceWaitTicks(app));
+    const wrote = sendDataRecord(app, conn_id, data);
     if (wrote != @as(i32, @intCast(data.len))) {
         stats.tcp_errors +%= 1;
         stats.last_tcp_result = wrote;
@@ -1792,6 +1807,36 @@ fn sendData(app: *const App, conn_id: u32, stats: *ServiceStats, data: []const u
     stats.bytes_tx +%= data.len;
     stats.data_bytes_tx +%= data.len;
     return true;
+}
+
+fn sendDataRecord(app: *const App, conn_id: u32, data: []const u8) i32 {
+    const transfer = r4os.stream_transfer;
+    const time = r4os.time_contract.checked;
+    const actual = app.sys.base.generation2 orelse return r4os.abi.err_no_group;
+    var clock = transfer.adapters.PlatformClock.fromContext2(actual) catch return r4os.abi.err_no_fn;
+    var initial: time.ClockSample = .{};
+    const sampled = transfer.adapters.PlatformClock.sample(&clock, &initial);
+    if (sampled != 0) return sampled;
+    var writer = transfer.Transfer.init(.write_all, data.len, initial, .{
+        .kind = r4os.abi.timeout_kind_finite,
+        .nanoseconds = tcp_write_wait_ms * 1_000_000,
+    }) catch return r4os.abi.service_api_result_invalid;
+    var endpoint: r4os.abi.ServiceInfo = .{};
+    const opened = app.sys.serviceOpen("TCPSVC", &endpoint);
+    if (opened != 0) return opened;
+    if (endpoint.handle == 0) return r4os.abi.service_api_result_no_endpoint;
+    defer _ = app.sys.serviceClose(endpoint.handle);
+    var tcp = transfer.adapters.Tcp.fromContext2(actual, endpoint.handle, conn_id) catch return r4os.abi.err_no_fn;
+    while (true) {
+        const progress = writer.writeStep(data[@intCast(writer.bytes)..], r4os.abi.net_service_tcp_write_max, app.sys.programShouldClose(), transfer.adapters.PlatformClock.sample, &clock, transfer.adapters.Tcp.write, &tcp) catch return r4os.abi.service_api_result_invalid;
+        if (progress.flags & transfer.core.terminal != 0) {
+            if (progress.outcome == @intFromEnum(transfer.Outcome.complete)) return @intCast(progress.bytes);
+            // A timed out/uncertain call may have delivered bytes. Do not
+            // repeat this record; the FTP data connection is retired.
+            return if (progress.error_code < 0) progress.error_code else r4os.abi.service_api_result_timeout;
+        }
+        if (progress.last_bytes == 0) app.sys.sleepTicks(1);
+    }
 }
 
 fn pumpServiceRequests(app: *const App, endpoint_handle: u32, stats: *ServiceStats) void {
@@ -1875,24 +1920,45 @@ fn isZeroIp(ip: [4]u8) bool {
     return ip[0] == 0 and ip[1] == 0 and ip[2] == 0 and ip[3] == 0;
 }
 
+fn listenOnce(app: *const App, stats: *ServiceStats, ticks: u64) bool {
+    var result: r4os.abi.NetServiceTcpResult = .{};
+    const rc = app.net.tcpListenServiceResultWait(listen_port, &result, ticks);
+    stats.last_tcp_result = if (rc == 0) result.result else rc;
+    if (rc != 0 or result.result != r4os.abi.tcp_result_ok) return false;
+    stats.listen_ready = 1;
+    setLastError(stats, "listen-ready");
+    app.sys.write("FTPSVC listen ");
+    app.sys.printU64(listen_port);
+    app.sys.println(": ready");
+    return true;
+}
+
 fn waitForListen(app: *const App, stats: *ServiceStats) bool {
-    var waited: u32 = 0;
-    while (waited < listen_wait_ticks) : (waited += 1) {
-        var result: r4os.abi.NetServiceTcpResult = .{};
-        const rc = app.net.tcpListenServiceResultWait(listen_port, &result, tcpServiceWaitTicks(app));
-        stats.last_tcp_result = if (rc == 0) result.result else rc;
-        if (rc == 0 and result.result == r4os.abi.tcp_result_ok) {
-            stats.listen_ready = 1;
-            setLastError(stats, "listen-ready");
-            app.sys.println("FTPSVC listen 21: ready");
-            return true;
-        }
-        if (waited == 0) app.sys.println("FTPSVC waiting for TCPSVC/network on port 21");
+    const actual = app.sys.base.generation2 orelse return false;
+    const clock = r4os.inventory_reader.PlatformClock.fromContext2(actual) catch return false;
+    var budget = r4os.rpc_budget.Budget.fromTicks(clock.read, listen_wait_ticks) catch return false;
+    var first = true;
+    while (!app.sys.programShouldClose()) {
+        const left = budget.remainingTicks() catch break;
+        if (listenOnce(app, stats, @min(left, tcpServiceWaitTicks(app)))) return true;
+        if (first) app.sys.println("FTPSVC waiting for TCPSVC/network");
+        first = false;
         app.sys.sleepTicks(1);
     }
     stats.tcp_errors +%= 1;
     setLastError(stats, "listen-timeout");
     return false;
+}
+
+// A structured listener failure is different from an empty accept or an
+// unavailable RPC. Re-register the same port; never discard a session here.
+fn acceptLostListener(result: *const r4os.abi.NetServiceTcpResult) bool {
+    return result.action == r4os.abi.net_service_tcp_action_accept_poll and
+        result.result == r4os.abi.tcp_result_bad_state and
+        result.conn_id == 0 and
+        result.flags & r4os.abi.net_service_tcp_flag_lifecycle_valid != 0 and
+        (result.lifecycle_cause == r4os.abi.net_service_socket_lifecycle_timeout or
+        result.lifecycle_cause == r4os.abi.net_service_socket_lifecycle_bad_handle);
 }
 
 fn closeListener(app: *const App, stats: *ServiceStats) void {
@@ -2422,15 +2488,20 @@ fn waitServiceOpen(app: *const App, info: *r4os.abi.ServiceInfo, max_ticks: u32)
     return null;
 }
 
-fn hasArg(args: [*:0]const u8, wanted: []const u8) bool {
-    var offset: usize = 0;
-    while (offset < 256 and args[offset] != 0) {
-        while (offset < 256 and (args[offset] == ' ' or args[offset] == '\t')) : (offset += 1) {}
-        const start = offset;
-        while (offset < 256 and args[offset] != 0 and args[offset] != ' ' and args[offset] != '\t') : (offset += 1) {}
-        if (equalsIgnoreCase(args[start..offset], wanted)) return true;
+const ServiceAction = enum(u8) { run, status, ping, selftest };
+
+fn serviceAction(app: *const r4os.App2) r4os.arguments.Error!ServiceAction {
+    const raw = app.args();
+    var failure: r4os.arguments.Failure = .{};
+    var cursor = try app.argCursor(.{ .quotes = @intFromEnum(r4os.arguments.Quotes.none), .max_bytes = 256 }, &failure);
+    var action: ServiceAction = .run;
+    while (try cursor.next()) |token| {
+        const arg = try token.bytes(raw);
+        if (std.ascii.eqlIgnoreCase(arg, selftest_arg)) action = .selftest;
+        if (@intFromEnum(action) < @intFromEnum(ServiceAction.ping) and std.ascii.eqlIgnoreCase(arg, ping_arg)) action = .ping;
+        if (action == .run and std.ascii.eqlIgnoreCase(arg, status_arg)) action = .status;
     }
-    return false;
+    return action;
 }
 
 fn copyPath(out: []u8, src: []const u8) ?[]const u8 {
