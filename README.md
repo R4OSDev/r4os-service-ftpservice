@@ -14,6 +14,15 @@ its TCP writes and advances by the accepted prefix. An uncertain write ends
 the data connection. Upload staging and publication keep their separate
 commit and reconciliation rules.
 
+Connection acceptance and maintenance use a 100 ms interval converted through
+the system clock. Control sessions share a 100 ms input budget per sweep.
+Each control READ uses TCPSVC's absolute operation deadline and an unbounded
+reply transport: already consumed command bytes must survive a late reply.
+Async request storage stays alive until Close releases it, including BUSY.
+Receiving input schedules the next sweep after the endpoint's cooperative
+tick, without another 100 ms pause. Endpoint requests retain this turn even
+when the input budget has already elapsed.
+
 The manifest is the single source of truth for the artifact, imports, image
 target, and package metadata.
 

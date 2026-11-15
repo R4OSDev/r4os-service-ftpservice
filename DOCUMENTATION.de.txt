@@ -63,6 +63,18 @@ kann wegen des festen passiven Ports 2020 jeweils nur ein passiver Transfer
 vorbereitet sein. `SERVMAN STATUS FTPSVC` zeigt aktuelle und bisher maximale
 Control-Sitzungen als `active=<n>/4 high=<n>`.
 
+Seit 0.91.24 (FTPSVC 0.1.13) werden neue Verbindungen und ausstehende
+STOR-Bereinigungen alle 100 ms geprueft, unabhaengig von der Tickfrequenz.
+Aktive Sitzungen teilen sich je Durchlauf ein 100-ms-Lesebudget. Ein READ
+wartet in TCPSVC bis zu seinem absoluten Operationsende auf Eingabe; seine
+Antwort darf nach dem Konsumieren von Bytes nicht durch ein Transporttimeout
+verfallen. Die asynchronen Puffer bleiben bis zur bestaetigten Freigabe
+erhalten, auch bei BUSY. Nach empfangenen Bytes folgt der naechste Durchlauf
+nach dem kooperativen Endpunkt-Tick ohne weitere 100-ms-Pause. Dieser Tick
+erhaelt Status- und Stopanfragen auch bei ausgeschoepftem Lesebudget.
+Datenkanaele, vier Sitzungsplaetze und das fuenfminuetige Idle-Limit
+behalten ihre bisherigen Vertraege.
+
 Seit 0.60.20 schreibt `STOR` nie direkt in den sichtbaren Zielnamen. Der
 Dienst reserviert einen privaten 8.3-Sibling-Stage, streamt ihn mit
 `fileStreamBegin(open_create)`/`fileStreamWrite`, behaelt die Ownership bei

@@ -2,6 +2,7 @@ const r4os = @import("r4os");
 const std = @import("std");
 const path_text = @import("path_text");
 const control_line = @import("control_line.zig");
+const control_read = @import("control_read.zig");
 
 const service_name = "FTPSVC";
 const service_path = "C:\\R4OS\\SERVICES\\FTPSVC.R4X";
@@ -25,7 +26,7 @@ const tcp_service_wait_ms: u64 = 500;
 const tcp_write_wait_ms: u64 = 5000;
 const session_idle_ms: u64 = 5 * 60 * 1000;
 const control_session_capacity: usize = 4;
-const accept_idle_poll_ticks: u64 = 10;
+const idle_poll_ms: u64 = 100;
 const data_accept_wait_ms: u64 = 10000;
 const data_idle_ms: u64 = 3000;
 const transfer_chunk_max: usize = 4096;
@@ -207,6 +208,7 @@ fn runService(app: *const App) i32 {
     var next_accept_poll: u64 = 0;
     var next_maintenance_poll: u64 = 0;
     var service_loop = r4os.ServiceLoop.init(app.sys, endpoint_handle, .{});
+    const idle_poll_ticks = app.sys.ticksFromMilliseconds(idle_poll_ms);
 
     while (true) {
         const now = app.sys.ticks();
@@ -218,25 +220,33 @@ fn runService(app: *const App) i32 {
                 // not reused until cleanup or publication is conclusive.
                 _ = resolveStoreTransfer(app, session, &stats);
             }
-            next_maintenance_poll = now + accept_idle_poll_ticks;
+            next_maintenance_poll = now +| idle_poll_ticks;
         }
 
         if (now >= next_accept_poll) {
             if (availableSession(sessions[0..])) |session| {
                 _ = pollClient(app, session, &stats);
             }
-            next_accept_poll = now + accept_idle_poll_ticks;
+            next_accept_poll = now +| idle_poll_ticks;
         }
 
+        // Share one 100ms input budget across the four control sessions.
+        // A silent peer must not monopolize the service or force tick polls.
+        const active = activeSessionCount(sessions[0..]);
+        const read_wait = if (active == 0) 0 else @max(@as(u64, 1), idle_poll_ticks / active);
+        const bytes_before = stats.bytes_rx;
         for (&sessions) |*session| {
-            if (session.active) pollSession(app, endpoint_handle, session, &stats);
+            if (session.active) pollSession(app, endpoint_handle, session, &stats, read_wait);
         }
 
         const after_poll = app.sys.ticks();
-        const deadline = if (activeSessionCount(sessions[0..]) != 0)
+        // ServiceLoop checks an expired deadline before its endpoint. Keep
+        // one future tick so status/stop requests cannot starve behind a
+        // full input budget or a continuous stream of control commands.
+        const deadline = if (stats.bytes_rx != bytes_before)
             after_poll +| 1
         else
-            @min(next_accept_poll, next_maintenance_poll);
+            @max(after_poll +| 1, @min(next_accept_poll, next_maintenance_poll));
         switch (service_loop.wait(deadline)) {
             .requests => |pending| {
                 const rc = service_loop.drain(pending, handleRequest, .{ app, endpoint_handle, &stats });
@@ -420,7 +430,7 @@ fn pollClient(app: *const App, session: *Session, stats: *ServiceStats) bool {
     return true;
 }
 
-fn pollSession(app: *const App, endpoint_handle: u32, session: *Session, stats: *ServiceStats) void {
+fn pollSession(app: *const App, endpoint_handle: u32, session: *Session, stats: *ServiceStats, read_wait: u64) void {
     if (!session.active) return;
     const now = app.sys.ticks();
     if (now - session.last_activity > app.sys.ticksFromMilliseconds(session_idle_ms)) {
@@ -430,15 +440,11 @@ fn pollSession(app: *const App, endpoint_handle: u32, session: *Session, stats: 
     }
 
     var buf: [128]u8 = undefined;
-    // 0.56.40: auch der Control-Kanal-Read ist KONSUMIEREND - verfiel
-    // der Bounded-Servicecall nach dem Kernel-Read, ging die komplette
-    // Kommandozeile verloren (Gate-Befund bei 1000 Hz: RETR kam nie an,
-    // Client sah leere Antwort; endpoint timeout=1 cancel=1). Gleiche
-    // Klasse wie der 0.56.39-STOR-Tail-Verlust.
-    const got = app.net.tcpReadWaitServiceConsumeSafe(session.conn_id, buf[0..], app.sys.ticksFromMilliseconds(1), tcpServiceWaitTicks(app));
+    // The server bounds the wait for input. Delivery and buffer retirement
+    // remain unbounded so a consumed command can never expire in transport.
+    const got = control_read.read(app, session.conn_id, buf[0..], read_wait);
     if (got < 0) {
         if (tcpReadTransientRecoverable(app, session.conn_id, stats)) {
-            app.sys.sleepTicks(1);
             return;
         }
         stats.tcp_errors +%= 1;
@@ -449,7 +455,7 @@ fn pollSession(app: *const App, endpoint_handle: u32, session: *Session, stats: 
 
     const got_len: usize = @intCast(got);
     stats.bytes_rx +%= got_len;
-    session.last_activity = now;
+    session.last_activity = app.sys.ticks();
     var i: usize = 0;
     while (i < got_len and session.active) : (i += 1) {
         switch (control_line.push(&session.line, &session.line_len, &session.line_discarding, buf[i])) {
@@ -1958,7 +1964,7 @@ fn acceptLostListener(result: *const r4os.abi.NetServiceTcpResult) bool {
         result.conn_id == 0 and
         result.flags & r4os.abi.net_service_tcp_flag_lifecycle_valid != 0 and
         (result.lifecycle_cause == r4os.abi.net_service_socket_lifecycle_timeout or
-        result.lifecycle_cause == r4os.abi.net_service_socket_lifecycle_bad_handle);
+            result.lifecycle_cause == r4os.abi.net_service_socket_lifecycle_bad_handle);
 }
 
 fn closeListener(app: *const App, stats: *ServiceStats) void {
@@ -2645,4 +2651,5 @@ test "FTP dispatch preserves pathname spaces and rejects complete invalid record
     try std.testing.expect(normalizeFtpPath("C:\\TEMP", "x" ** 256 ++ "/../ok", &out) == null);
     try std.testing.expect(normalizeFtpPath("C:\\TEMP", "\x81.bin", &out) == null);
     std.testing.refAllDecls(control_line);
+    std.testing.refAllDecls(control_read);
 }
